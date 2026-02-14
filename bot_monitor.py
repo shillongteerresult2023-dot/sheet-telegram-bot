@@ -1,15 +1,16 @@
 """
-bot_monitor.py (async, race-proof)
-Sends only the URL text (no extra lines) for each new link detected in column A.
-Writes 'SENDING' then 'SENT <timestamp> (msgid:...)' into column B.
+bot_monitor.py (Railway production version)
+Auto-restart enabled.
+Uses SERVICE_ACCOUNT_JSON environment variable.
 """
 
 import asyncio
 import re
 import os
 import json
-from datetime import datetime
 import sys
+import time
+from datetime import datetime
 
 from telethon import TelegramClient
 import gspread
@@ -31,6 +32,7 @@ SESSION_NAME = 'telegram_user_session'
 # ----------------------------
 
 URL_RE = re.compile(r'(https?://[^\s]+)', re.IGNORECASE)
+
 SCOPES = [
     'https://www.googleapis.com/auth/spreadsheets',
     'https://www.googleapis.com/auth/drive'
@@ -41,7 +43,7 @@ def col_idx(letter):
     return ord(letter.upper()) - ord('A') + 1
 
 
-# ✅ UPDATED GOOGLE AUTH (ENV VARIABLE METHOD)
+# ✅ Google Auth via Railway ENV variable
 def gsheet_client_from_service_account_json():
     sa_json = os.getenv("SERVICE_ACCOUNT_JSON")
     if not sa_json:
@@ -68,16 +70,17 @@ async def run_blocking(func, *args, **kwargs):
 
 
 async def main():
+
+    # Windows compatibility
     if sys.platform.startswith('win'):
         try:
-            import asyncio as _asyncio
-            _asyncio.set_event_loop_policy(_asyncio.WindowsSelectorEventLoopPolicy())
+            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
         except Exception:
             pass
 
     client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
     await client.start()
-    print("✔ Telegram login complete (async).")
+    print("✔ Telegram connected")
 
     try:
         gc = await run_blocking(gsheet_client_from_service_account_json)
@@ -85,64 +88,62 @@ async def main():
     except Exception as e:
         print("Google Sheets error:", e)
         await client.disconnect()
-        return
+        raise e  # important: allow restart
 
     watch_idx = col_idx(WATCH_COLUMN)
     sent_idx = col_idx(SENT_COLUMN)
 
-    print(f"Watching sheet '{ws.title}' column {WATCH_COLUMN} -> status in {SENT_COLUMN}")
+    print(f"Watching sheet '{ws.title}' column {WATCH_COLUMN} → status in {SENT_COLUMN}")
 
-    try:
-        while True:
-            try:
-                rows = await run_blocking(ws.get_all_values)
+    while True:
+        try:
+            rows = await run_blocking(ws.get_all_values)
 
-                for r, row in enumerate(rows, start=1):
-                    try:
-                        cell = row[watch_idx-1].strip() if len(row) >= watch_idx else ''
-                        status = row[sent_idx-1].strip() if len(row) >= sent_idx else ''
+            for r, row in enumerate(rows, start=1):
+                try:
+                    cell = row[watch_idx-1].strip() if len(row) >= watch_idx else ''
+                    status = row[sent_idx-1].strip() if len(row) >= sent_idx else ''
 
-                        if not cell or status.upper().startswith(('SENT', 'SENDING', 'ERROR')):
-                            continue
+                    if not cell or status.upper().startswith(('SENT', 'SENDING', 'ERROR')):
+                        continue
 
-                        m = URL_RE.search(cell)
-                        if not m:
-                            continue
-                        url = m.group(1)
+                    m = URL_RE.search(cell)
+                    if not m:
+                        continue
 
-                        try:
-                            await run_blocking(ws.update_cell, r, sent_idx, "SENDING")
-                        except Exception as write_err:
-                            print(f"Row {r}: couldn't mark SENDING ({write_err}); skipping")
-                            continue
+                    url = m.group(1)
 
-                        try:
-                            res = await client.send_message(TARGET, url)
-                            t = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                            mid = getattr(res, 'id', 'NA')
-                            await run_blocking(ws.update_cell, r, sent_idx, f"SENT {t} (msgid:{mid})")
-                            print(f"[SENT] {WATCH_COLUMN}{r}: {url}")
-                        except Exception as send_err:
-                            print(f"Row {r}: send error: {send_err}")
-                            try:
-                                await run_blocking(ws.update_cell, r, sent_idx, f"ERROR {str(send_err)[:120]}")
-                            except Exception:
-                                pass
+                    await run_blocking(ws.update_cell, r, sent_idx, "SENDING")
 
-                    except Exception as row_err:
-                        print(f"Unexpected row error (row {r}):", row_err)
+                    res = await client.send_message(TARGET, url)
+                    t = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    mid = getattr(res, 'id', 'NA')
 
-                await asyncio.sleep(POLL_INTERVAL)
+                    await run_blocking(
+                        ws.update_cell,
+                        r,
+                        sent_idx,
+                        f"SENT {t} (msgid:{mid})"
+                    )
 
-            except Exception as e:
-                print("Main loop error:", e)
-                await asyncio.sleep(5)
+                    print(f"[SENT] {WATCH_COLUMN}{r}: {url}")
 
-    except KeyboardInterrupt:
-        print("Stopped by user.")
-    finally:
-        await client.disconnect()
+                except Exception as row_err:
+                    print(f"Row {r} error:", row_err)
+
+            await asyncio.sleep(POLL_INTERVAL or 8)
+
+        except Exception as loop_error:
+            print("Main loop error:", loop_error)
+            await asyncio.sleep(5)
 
 
+# 🔥 AUTO RESTART WRAPPER
 if __name__ == '__main__':
-    asyncio.run(main())
+    while True:
+        try:
+            asyncio.run(main())
+        except Exception as e:
+            print("🔥 Bot crashed:", e)
+            print("Restarting in 15 seconds...")
+            time.sleep(15)

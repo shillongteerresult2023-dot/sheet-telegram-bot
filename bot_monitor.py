@@ -7,6 +7,7 @@ Writes 'SENDING' then 'SENT <timestamp> (msgid:...)' into column B.
 import asyncio
 import re
 import os
+import json
 from datetime import datetime
 import sys
 
@@ -17,30 +18,40 @@ from google.oauth2.service_account import Credentials
 # ---------- CONFIG ----------
 API_ID = 36628994
 API_HASH = '98bd0303ffbbeb16535e503d830f88fd'
-TARGET = '@liveindexbot'            # where messages go
+TARGET = '@liveindexbot'
 
 SPREADSHEET_NAME = 'sheet-bot'
 SPREADSHEET_ID = None
-WORKSHEET_NAME = None               # first worksheet
+WORKSHEET_NAME = None
 
-WATCH_COLUMN = 'A'                  # column with pasted links
-SENT_COLUMN = 'B'                   # column where status is written
-POLL_INTERVAL = 8                   # seconds between polls
+WATCH_COLUMN = 'A'
+SENT_COLUMN = 'B'
+POLL_INTERVAL = 8
 SESSION_NAME = 'telegram_user_session'
 # ----------------------------
 
 URL_RE = re.compile(r'(https?://[^\s]+)', re.IGNORECASE)
-SCOPES = ['https://www.googleapis.com/auth/spreadsheets',
-          'https://www.googleapis.com/auth/drive']
+SCOPES = [
+    'https://www.googleapis.com/auth/spreadsheets',
+    'https://www.googleapis.com/auth/drive'
+]
 
 
-def col_idx(letter): return ord(letter.upper()) - ord('A') + 1
+def col_idx(letter):
+    return ord(letter.upper()) - ord('A') + 1
 
 
-def gsheet_client_from_service_account_json(filename='service_account.json'):
-    if not os.path.exists(filename):
-        raise FileNotFoundError("service_account.json missing in script folder")
-    creds = Credentials.from_service_account_file(filename, scopes=SCOPES)
+# ✅ UPDATED GOOGLE AUTH (ENV VARIABLE METHOD)
+def gsheet_client_from_service_account_json():
+    sa_json = os.getenv("SERVICE_ACCOUNT_JSON")
+    if not sa_json:
+        raise Exception("SERVICE_ACCOUNT_JSON variable not set")
+
+    creds_dict = json.loads(sa_json)
+    creds = Credentials.from_service_account_info(
+        creds_dict,
+        scopes=SCOPES
+    )
     return gspread.authorize(creds)
 
 
@@ -57,7 +68,6 @@ async def run_blocking(func, *args, **kwargs):
 
 
 async def main():
-    # Windows event-loop policy (no-op on other OS)
     if sys.platform.startswith('win'):
         try:
             import asyncio as _asyncio
@@ -70,7 +80,7 @@ async def main():
     print("✔ Telegram login complete (async).")
 
     try:
-        gc = await run_blocking(gsheet_client_from_service_account_json, 'service_account.json')
+        gc = await run_blocking(gsheet_client_from_service_account_json)
         ws = await run_blocking(open_sheet_sync, gc)
     except Exception as e:
         print("Google Sheets error:", e)
@@ -81,6 +91,7 @@ async def main():
     sent_idx = col_idx(SENT_COLUMN)
 
     print(f"Watching sheet '{ws.title}' column {WATCH_COLUMN} -> status in {SENT_COLUMN}")
+
     try:
         while True:
             try:
@@ -91,7 +102,6 @@ async def main():
                         cell = row[watch_idx-1].strip() if len(row) >= watch_idx else ''
                         status = row[sent_idx-1].strip() if len(row) >= sent_idx else ''
 
-                        # Skip empty or processed rows
                         if not cell or status.upper().startswith(('SENT', 'SENDING', 'ERROR')):
                             continue
 
@@ -100,24 +110,12 @@ async def main():
                             continue
                         url = m.group(1)
 
-                        # Mark as SENDING immediately
                         try:
                             await run_blocking(ws.update_cell, r, sent_idx, "SENDING")
                         except Exception as write_err:
                             print(f"Row {r}: couldn't mark SENDING ({write_err}); skipping")
                             continue
 
-                        # Optional re-check to ensure ownership of SENDING
-                        try:
-                            latest = await run_blocking(ws.row_values, r)
-                            latest_status = latest[sent_idx-1].strip() if len(latest) >= sent_idx else ''
-                            if not latest_status.upper().startswith('SENDING'):
-                                print(f"Row {r}: SENDING replaced by '{latest_status}'; skipping")
-                                continue
-                        except Exception:
-                            pass
-
-                        # Send only the URL (no extra text)
                         try:
                             res = await client.send_message(TARGET, url)
                             t = datetime.now().strftime('%Y-%m-%d %H:%M:%S')

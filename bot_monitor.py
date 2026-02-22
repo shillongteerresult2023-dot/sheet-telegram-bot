@@ -1,5 +1,6 @@
 import asyncio
 import re
+import time
 from datetime import datetime
 
 from telethon import TelegramClient
@@ -30,16 +31,23 @@ SCOPES = [
     'https://www.googleapis.com/auth/drive'
 ]
 
+# Prevent duplicate processing in same runtime
+PROCESSED_ROWS = set()
+
+
 def col_idx(letter):
     return ord(letter.upper()) - ord('A') + 1
+
 
 def gsheet_client():
     creds = Credentials.from_service_account_file(
         'service_account.json', scopes=SCOPES)
     return gspread.authorize(creds)
 
+
 async def run_blocking(func, *args):
     return await asyncio.to_thread(func, *args)
+
 
 async def main():
 
@@ -48,7 +56,6 @@ async def main():
     print("✔ Telegram connected")
 
     gc = await run_blocking(gsheet_client)
-
     spreadsheet = gc.open(SPREADSHEET_NAME)
 
     print("Available sheets:")
@@ -68,14 +75,17 @@ async def main():
 
         for r, row in enumerate(rows, start=1):
 
+            if r in PROCESSED_ROWS:
+                continue
+
             if len(row) < email_idx:
                 continue
 
-            cell = row[watch_idx-1].strip()
+            cell = row[watch_idx-1].strip() if len(row) >= watch_idx else ''
             status = row[status_idx-1].strip() if len(row) >= status_idx else ''
 
-            # ONLY skip SENT & ERROR (allow retry if stuck on SENDING)
-            if not cell or status.startswith(('SENT', 'ERROR')):
+            # Skip already finished rows
+            if not cell or status.startswith(('SENT', 'ERROR', 'LIMIT')):
                 continue
 
             urls = URL_RE.findall(cell)
@@ -98,7 +108,6 @@ async def main():
 
             limit_value = int(limits[limit_row_number-1][1])
 
-            # SAFE used value
             used_raw = limits[limit_row_number-1][2] if len(limits[limit_row_number-1]) > 2 else "0"
             try:
                 used_value = int(used_raw)
@@ -113,6 +122,7 @@ async def main():
 
             if remaining <= 0:
                 await run_blocking(form_ws.update_cell, r, status_idx, "LIMIT REACHED")
+                PROCESSED_ROWS.add(r)
                 continue
 
             allowed_urls = urls[:remaining]
@@ -124,16 +134,23 @@ async def main():
             for url in allowed_urls:
                 try:
                     print("Sending:", url)
+
+                    # 🔥 IMPORTANT FIX (prevents double indexing)
                     await asyncio.wait_for(
-                        client.send_message(TARGET, url),
+                        client.send_message(
+                            TARGET,
+                            url,
+                            link_preview=False
+                        ),
                         timeout=20
                     )
+
                     sent_count += 1
                     await asyncio.sleep(2)
+
                 except Exception as e:
                     print("Send error:", e)
 
-            # Update Used correctly
             new_used = used_value + sent_count
             await run_blocking(limit_ws.update_cell, limit_row_number, 3, new_used)
 
@@ -145,7 +162,17 @@ async def main():
                 f"SENT {t} ({sent_count} links)"
             )
 
+            PROCESSED_ROWS.add(r)
+
         await asyncio.sleep(POLL_INTERVAL)
 
+
+# 🔥 Auto Restart Protection
 if __name__ == '__main__':
-    asyncio.run(main())
+    while True:
+        try:
+            asyncio.run(main())
+        except Exception as e:
+            print("🔥 Bot crashed:", e)
+            print("Restarting in 15 seconds...")
+            time.sleep(15)

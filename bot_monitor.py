@@ -1,6 +1,5 @@
 import asyncio
 import re
-import time
 from datetime import datetime
 
 from telethon import TelegramClient
@@ -31,7 +30,6 @@ SCOPES = [
     'https://www.googleapis.com/auth/drive'
 ]
 
-# Prevent duplicate processing in same runtime
 PROCESSED_ROWS = set()
 
 
@@ -51,16 +49,13 @@ async def run_blocking(func, *args):
 
 async def main():
 
+    # 🚀 THIS WILL ASK FOR LOGIN ON RAILWAY
     client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
     await client.start()
     print("✔ Telegram connected")
 
     gc = await run_blocking(gsheet_client)
     spreadsheet = gc.open(SPREADSHEET_NAME)
-
-    print("Available sheets:")
-    for s in spreadsheet.worksheets():
-        print(" -", s.title)
 
     form_ws = spreadsheet.worksheet(FORM_SHEET_NAME)
     limit_ws = spreadsheet.worksheet(LIMIT_SHEET_NAME)
@@ -84,7 +79,6 @@ async def main():
             cell = row[watch_idx-1].strip() if len(row) >= watch_idx else ''
             status = row[status_idx-1].strip() if len(row) >= status_idx else ''
 
-            # Skip already finished rows
             if not cell or status.startswith(('SENT', 'ERROR', 'LIMIT')):
                 continue
 
@@ -103,7 +97,6 @@ async def main():
                     break
 
             if not limit_row_number:
-                print("Email not found:", email)
                 continue
 
             limit_value = int(limits[limit_row_number-1][1])
@@ -115,10 +108,6 @@ async def main():
                 used_value = 0
 
             remaining = limit_value - used_value
-
-            print("Email:", email)
-            print("Total URLs:", len(urls))
-            print("Remaining:", remaining)
 
             if remaining <= 0:
                 await run_blocking(form_ws.update_cell, r, status_idx, "LIMIT REACHED")
@@ -133,21 +122,13 @@ async def main():
 
             for url in allowed_urls:
                 try:
-                    print("Sending:", url)
-
-                    # 🔥 IMPORTANT FIX (prevents double indexing)
-                    await asyncio.wait_for(
-                        client.send_message(
-                            TARGET,
-                            url,
-                            link_preview=False
-                        ),
-                        timeout=20
+                    await client.send_message(
+                        TARGET,
+                        url,
+                        link_preview=False
                     )
-
                     sent_count += 1
                     await asyncio.sleep(2)
-
                 except Exception as e:
                     print("Send error:", e)
 
@@ -167,12 +148,6 @@ async def main():
         await asyncio.sleep(POLL_INTERVAL)
 
 
-# 🔥 Auto Restart Protection
+# 🚀 TEMPORARY – FOR SESSION CREATION
 if __name__ == '__main__':
-    while True:
-        try:
-            asyncio.run(main())
-        except Exception as e:
-            print("🔥 Bot crashed:", e)
-            print("Restarting in 15 seconds...")
-            time.sleep(15)
+    asyncio.run(main())

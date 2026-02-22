@@ -1,10 +1,8 @@
 import asyncio
-import os
 import re
 from datetime import datetime
 
 from telethon import TelegramClient
-from telethon.sessions import StringSession
 import gspread
 from google.oauth2.service_account import Credentials
 
@@ -22,6 +20,7 @@ STATUS_COLUMN = 'B'
 EMAIL_COLUMN = 'C'
 
 POLL_INTERVAL = 8
+SESSION_NAME = 'telegram_user_session'
 # ===========================
 
 URL_RE = re.compile(r'(https?://[^\s,]+)', re.IGNORECASE)
@@ -35,15 +34,8 @@ def col_idx(letter):
     return ord(letter.upper()) - ord('A') + 1
 
 def gsheet_client():
-    sa_json = os.getenv("SERVICE_ACCOUNT_JSON")
-    if not sa_json:
-        raise Exception("SERVICE_ACCOUNT_JSON not set")
-
-    creds_dict = eval(sa_json)
-    creds = Credentials.from_service_account_info(
-        creds_dict,
-        scopes=SCOPES
-    )
+    creds = Credentials.from_service_account_file(
+        'service_account.json', scopes=SCOPES)
     return gspread.authorize(creds)
 
 async def run_blocking(func, *args):
@@ -51,17 +43,18 @@ async def run_blocking(func, *args):
 
 async def main():
 
-    session_string = os.getenv("TELEGRAM_SESSION")
-    if not session_string:
-        raise Exception("TELEGRAM_SESSION not set")
-
-    client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
+    client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
     await client.start()
     print("✔ Telegram connected")
 
     gc = await run_blocking(gsheet_client)
 
     spreadsheet = gc.open(SPREADSHEET_NAME)
+
+    print("Available sheets:")
+    for s in spreadsheet.worksheets():
+        print(" -", s.title)
+
     form_ws = spreadsheet.worksheet(FORM_SHEET_NAME)
     limit_ws = spreadsheet.worksheet(LIMIT_SHEET_NAME)
 
@@ -70,74 +63,87 @@ async def main():
     email_idx = col_idx(EMAIL_COLUMN)
 
     while True:
-        try:
-            rows = await run_blocking(form_ws.get_all_values)
 
-            for r, row in enumerate(rows, start=1):
+        rows = await run_blocking(form_ws.get_all_values)
 
-                if len(row) < email_idx:
-                    continue
+        for r, row in enumerate(rows, start=1):
 
-                cell = row[watch_idx-1].strip()
-                status = row[status_idx-1].strip() if len(row) >= status_idx else ''
+            if len(row) < email_idx:
+                continue
 
-                if not cell or status.startswith(('SENT', 'ERROR', 'SENDING')):
-                    continue
+            cell = row[watch_idx-1].strip()
+            status = row[status_idx-1].strip() if len(row) >= status_idx else ''
 
-                urls = URL_RE.findall(cell)
-                if not urls:
-                    continue
+            # ONLY skip SENT & ERROR (allow retry if stuck on SENDING)
+            if not cell or status.startswith(('SENT', 'ERROR')):
+                continue
 
-                email = row[email_idx-1].strip()
+            urls = URL_RE.findall(cell)
+            if not urls:
+                continue
 
-                limits = await run_blocking(limit_ws.get_all_values)
+            email = row[email_idx-1].strip()
 
-                limit_row_number = None
-                for lr, lrow in enumerate(limits, start=1):
-                    if lrow and lrow[0].strip().lower() == email.lower():
-                        limit_row_number = lr
-                        break
+            limits = await run_blocking(limit_ws.get_all_values)
 
-                if not limit_row_number:
-                    continue
+            limit_row_number = None
+            for lr, lrow in enumerate(limits, start=1):
+                if lrow and lrow[0].strip().lower() == email.lower():
+                    limit_row_number = lr
+                    break
 
-                limit_value = int(limits[limit_row_number-1][1])
-                used_value = int(limits[limit_row_number-1][2] or 0)
+            if not limit_row_number:
+                print("Email not found:", email)
+                continue
 
-                remaining = limit_value - used_value
+            limit_value = int(limits[limit_row_number-1][1])
 
-                if remaining <= 0:
-                    await run_blocking(form_ws.update_cell, r, status_idx, "LIMIT REACHED")
-                    continue
+            # SAFE used value
+            used_raw = limits[limit_row_number-1][2] if len(limits[limit_row_number-1]) > 2 else "0"
+            try:
+                used_value = int(used_raw)
+            except:
+                used_value = 0
 
-                allowed_urls = urls[:remaining]
+            remaining = limit_value - used_value
 
-                await run_blocking(form_ws.update_cell, r, status_idx, "SENDING")
+            print("Email:", email)
+            print("Total URLs:", len(urls))
+            print("Remaining:", remaining)
 
-                sent_count = 0
+            if remaining <= 0:
+                await run_blocking(form_ws.update_cell, r, status_idx, "LIMIT REACHED")
+                continue
 
-                for url in allowed_urls:
-                    try:
-                        await client.send_message(TARGET, url)
-                        sent_count += 1
-                        await asyncio.sleep(2)
-                    except Exception as e:
-                        print("Send error:", e)
+            allowed_urls = urls[:remaining]
 
-                new_used = used_value + sent_count
-                await run_blocking(limit_ws.update_cell, limit_row_number, 3, new_used)
+            await run_blocking(form_ws.update_cell, r, status_idx, "SENDING")
 
-                t = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                await run_blocking(
-                    form_ws.update_cell,
-                    r,
-                    status_idx,
-                    f"SENT {t} ({sent_count} links)"
-                )
+            sent_count = 0
 
-        except Exception as e:
-            print("🔥 Bot crashed:", e)
-            await asyncio.sleep(15)
+            for url in allowed_urls:
+                try:
+                    print("Sending:", url)
+                    await asyncio.wait_for(
+                        client.send_message(TARGET, url),
+                        timeout=20
+                    )
+                    sent_count += 1
+                    await asyncio.sleep(2)
+                except Exception as e:
+                    print("Send error:", e)
+
+            # Update Used correctly
+            new_used = used_value + sent_count
+            await run_blocking(limit_ws.update_cell, limit_row_number, 3, new_used)
+
+            t = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            await run_blocking(
+                form_ws.update_cell,
+                r,
+                status_idx,
+                f"SENT {t} ({sent_count} links)"
+            )
 
         await asyncio.sleep(POLL_INTERVAL)
 
